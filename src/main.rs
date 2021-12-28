@@ -1,20 +1,51 @@
 use {
+    boolinator::Boolinator,
     clap::{
         Arg,
-        App,
-        SubCommand,
+        App
     },
     indicatif::{
         ProgressBar,
         ProgressStyle,
-    }
+    },
+    nix::ioctl_read,
+    std::os::unix::{
+        fs::FileTypeExt,
+        io::AsRawFd,
+    },
+    tokio::{
+        fs::File,
+        io::AsyncReadExt,
+    },
 };
 
-struct Args {
+// See linux/fs.h
+const BLKGETSIZE64_CODE: u8 = 0x12;
+const BLKGETSIZE64_SEQ: u8 = 114;
 
+ioctl_read!(ioctl_blkgetsize64, BLKGETSIZE64_CODE, BLKGETSIZE64_SEQ, u64);
+
+async fn get_size(f: &File) -> u64 {
+    let meta = f.metadata().await.unwrap();
+    let file_type = meta.file_type();
+
+    if file_type.is_file() {
+        meta.len()
+    } else if file_type.is_block_device() {
+        let mut size: u64 = 0;
+        let size_ptr = &mut size as *mut u64;
+        let std_file = f.try_clone().await.unwrap().into_std().await;
+        unsafe {
+            ioctl_blkgetsize64(std_file.as_raw_fd(), size_ptr).unwrap();
+        }
+        size
+    } else {
+        panic!("Only regular files, block devices and symlinks to them are supported.");
+    }
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let matches = App::new("SSD Sync")
         .version("1.0")
         .author("Tamas Fabian <giganetom@gmail.com>")
@@ -37,20 +68,40 @@ fn main() {
             .index(2))
         .get_matches();
 
-    let source_name = matches.value_of("source");
-    let target_name = matches.value_of("target");
+    let source_name = matches.value_of("source").ok_or("Source name is mandatory").unwrap();
+    let target_name = matches.value_of("target").ok_or("Target name is mandatory").unwrap();
 
-    let steps = 2000000;
+    // Read both file sizes
+    let mut source = File::open(source_name).await.unwrap();
+    let target = File::open(target_name).await.unwrap();
 
-    let bar = ProgressBar::new(steps);
+    //let source_meta = source.metadata().await.unwrap();
+    //let target_meta = target.metadata().await.unwrap();
+
+    let source_size = get_size(&source).await;
+    let target_size = get_size(&target).await;
+
+    println!("{} -> {}", source_size, target_size);
+
+    //(source_size == target_size).ok_or("Lengths should match").unwrap();
+
+    let bar = ProgressBar::new(source_size);
 
     bar.set_style(ProgressStyle::default_bar()
         .template("{wide_bar} [{percent:>3}% ETA: {eta_precise}, {elapsed_precise} / {duration_precise}]")
         .progress_chars("##-"));
 
-    // Read both file sizes
+    let block_size = 409600;
 
-    // Sizes must match
+    let mut buffer: Vec<u8> = vec![0; block_size];
+
+    loop {
+        let n = source.read(&mut buffer).await.unwrap();
+        if n == 0 {
+            break;
+        }
+        bar.inc(n as u64);
+    }
 
     // Determine the number of blocks to read
 
@@ -63,9 +114,5 @@ fn main() {
     // Write differing blocks
 
     // Repeat
-
-    for _ in 0..steps {
-        bar.inc(1);
-    }
 
 }
