@@ -94,78 +94,69 @@ async fn main() {
         .template("{wide_bar} [{percent:>3}% {bytes_per_sec} ETA: {eta_precise}]")
         .progress_chars("##-"));
 
-    let block_size = 4096;
+    let block_size = 4096 * 4;
 
-    let (src_tx, mut src_rx) = mpsc::channel(100);
-    let (tgt_tx, mut tgt_rx) = mpsc::channel(100);
+    let (src_tx, mut src_rx) = mpsc::channel(10);
+    let (tgt_tx, mut tgt_rx) = mpsc::channel(10);
 
     // Reads source
     tokio::spawn( async move {
-        for i in 0..10 {
-            if let Err(_) = src_tx.send(i).await {
-
+        let mut buf = vec![0_u8; block_size];
+        loop {
+            let n = match source.read(&mut buf).await {
+                Err(e) => panic!("{}", e),
+                Ok(n) => n
+            };
+            if n == 0 {
+                return;
+            }
+            if let Err(_) = src_tx.send(buf[0..n].to_vec()).await {
+                return;
             }
         }
     });
 
     // Reads target
     tokio::spawn( async move {
-        for i in 100..110 {
-            if let Err(_) = tgt_tx.send(i).await {
-
+        let mut buf = vec![0_u8; block_size];
+        loop {
+            let n = match target.read(&mut buf).await {
+                Err(e) => panic!("{}", e),
+                Ok(n) => n
+            };
+            if n == 0 {
+                return;
+            }
+            if let Err(_) = tgt_tx.send(buf[0..n].to_vec()).await {
+                return;
             }
         }
     });
 
-    while let (Some(src), Some(tgt)) = join!(src_rx.recv(), tgt_rx.recv()) {
-        println!("Got: {} and {}", src, tgt);
-    }
-
-    /*let mut bufs: [Vec<u8>; 4] = [
-        vec![0_u8; block_size],
-        vec![0_u8; block_size],
-        vec![0_u8; block_size],
-        vec![0_u8; block_size],
-    ];
-
     let mut total = 0;
     let mut diff = 0;
 
-    let mut bufi = 0;
-    loop {
-        //let (current_bufs)
+    while let (Some(src), Some(tgt)) = join!(src_rx.recv(), tgt_rx.recv()) {
+        let src_l = src.len();
+        let tgt_l = tgt.len();
 
-        let (mut source_buffer, rest)  = bufs.split_first_mut().unwrap();
-        let (mut target_buffer, _rest) = rest.split_first_mut().unwrap();
-
-        let (n1_res, n2_res) = join!(
-            source.read(&mut source_buffer),
-            target.read(&mut target_buffer)
-        );
-
-        let n1 = n1_res.unwrap();
-        let n2 = n2_res.unwrap();
-
-        if n1 == 0 || n1 != n2 {
+        if src_l == 0 || tgt_l == 0 || src_l != tgt_l {
+            println!("Done.");
             break;
         }
 
-        if source_buffer != target_buffer {
+        let n = src_l;
+
+        bar.inc(n as u64);
+
+        if src != tgt {
             // Write
             diff += 1;
         }
         total += 1;
-
-        // Switch between 0 and 2
-        bufi = 2 - bufi;
-
-        let n = n1;
-
-        bar.inc(n as u64);
-    }*/
+    }
 
     bar.finish_at_current_pos();
 
-    //println!("\nTotal: {}, different: {}", total, diff);
-
+    println!("\nTotal: {}, different: {}", total, diff);
 }
