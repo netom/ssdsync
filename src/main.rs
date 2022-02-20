@@ -1,5 +1,5 @@
 use {
-    boolinator::Boolinator,
+    //boolinator::Boolinator,
     clap::{
         Arg,
         App
@@ -16,6 +16,9 @@ use {
     tokio::{
         fs::File,
         io::AsyncReadExt,
+        join,
+        try_join,
+        sync::mpsc,
     },
 };
 
@@ -73,7 +76,7 @@ async fn main() {
 
     // Read both file sizes
     let mut source = File::open(source_name).await.unwrap();
-    let target = File::open(target_name).await.unwrap();
+    let mut target = File::open(target_name).await.unwrap();
 
     //let source_meta = source.metadata().await.unwrap();
     //let target_meta = target.metadata().await.unwrap();
@@ -88,31 +91,81 @@ async fn main() {
     let bar = ProgressBar::new(source_size);
 
     bar.set_style(ProgressStyle::default_bar()
-        .template("{wide_bar} [{percent:>3}% ETA: {eta_precise}, {elapsed_precise} / {duration_precise}]")
+        .template("{wide_bar} [{percent:>3}% {bytes_per_sec} ETA: {eta_precise}]")
         .progress_chars("##-"));
 
-    let block_size = 409600;
+    let block_size = 4096;
 
-    let mut buffer: Vec<u8> = vec![0; block_size];
+    let (src_tx, mut src_rx) = mpsc::channel(100);
+    let (tgt_tx, mut tgt_rx) = mpsc::channel(100);
 
-    loop {
-        let n = source.read(&mut buffer).await.unwrap();
-        if n == 0 {
-            break;
+    // Reads source
+    tokio::spawn( async move {
+        for i in 0..10 {
+            if let Err(_) = src_tx.send(i).await {
+
+            }
         }
-        bar.inc(n as u64);
+    });
+
+    // Reads target
+    tokio::spawn( async move {
+        for i in 100..110 {
+            if let Err(_) = tgt_tx.send(i).await {
+
+            }
+        }
+    });
+
+    while let (Some(src), Some(tgt)) = join!(src_rx.recv(), tgt_rx.recv()) {
+        println!("Got: {} and {}", src, tgt);
     }
 
-    // Determine the number of blocks to read
+    /*let mut bufs: [Vec<u8>; 4] = [
+        vec![0_u8; block_size],
+        vec![0_u8; block_size],
+        vec![0_u8; block_size],
+        vec![0_u8; block_size],
+    ];
 
-    // Start loop. In the loop
+    let mut total = 0;
+    let mut diff = 0;
 
-    // Read two N-blocks in parallel
+    let mut bufi = 0;
+    loop {
+        //let (current_bufs)
 
-    // Determine the blocks to write
+        let (mut source_buffer, rest)  = bufs.split_first_mut().unwrap();
+        let (mut target_buffer, _rest) = rest.split_first_mut().unwrap();
 
-    // Write differing blocks
+        let (n1_res, n2_res) = join!(
+            source.read(&mut source_buffer),
+            target.read(&mut target_buffer)
+        );
 
-    // Repeat
+        let n1 = n1_res.unwrap();
+        let n2 = n2_res.unwrap();
+
+        if n1 == 0 || n1 != n2 {
+            break;
+        }
+
+        if source_buffer != target_buffer {
+            // Write
+            diff += 1;
+        }
+        total += 1;
+
+        // Switch between 0 and 2
+        bufi = 2 - bufi;
+
+        let n = n1;
+
+        bar.inc(n as u64);
+    }*/
+
+    bar.finish_at_current_pos();
+
+    //println!("\nTotal: {}, different: {}", total, diff);
 
 }
