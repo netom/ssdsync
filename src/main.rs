@@ -9,15 +9,20 @@ use {
         ProgressStyle,
     },
     nix::ioctl_read,
-    std::os::unix::{
-        fs::FileTypeExt,
-        io::AsRawFd,
+    std::{
+        io::SeekFrom,
+        os::unix::{
+            fs::FileTypeExt,
+            io::AsRawFd,
+        },
     },
     tokio::{
         fs::File,
         io::AsyncReadExt,
+        io::AsyncWriteExt,
+        io::AsyncSeekExt,
         join,
-        try_join,
+        select,
         sync::mpsc,
     },
 };
@@ -98,6 +103,7 @@ async fn main() {
 
     let (src_tx, mut src_rx) = mpsc::channel(10);
     let (tgt_tx, mut tgt_rx) = mpsc::channel(10);
+    let (wrt_tx, mut wrt_rx) = mpsc::channel::<(u64, Vec<u8>)>(10);
 
     // Reads source
     tokio::spawn( async move {
@@ -116,25 +122,59 @@ async fn main() {
         }
     });
 
-    // Reads target
+    // Reads/writes target
     tokio::spawn( async move {
         let mut buf = vec![0_u8; block_size];
+        let mut readpos = 0;
+        let mut seek_back = false;
         loop {
-            let n = match target.read(&mut buf).await {
-                Err(e) => panic!("{}", e),
-                Ok(n) => n
-            };
-            if n == 0 {
-                return;
-            }
-            if let Err(_) = tgt_tx.send(buf[0..n].to_vec()).await {
-                return;
+            select! {
+                n_ = target.read(&mut buf) => {
+                    let n = match n_ {
+                        Err(e) => panic!("{}", e),
+                        Ok(n) => n
+                    };
+                    if n == 0 {
+                        return;
+                    }
+                    if seek_back {
+                        if let Err(e) = target.seek(SeekFrom::Start(readpos)).await {
+                            println!("Seek error: {}", e);
+                        }
+                        seek_back = false;
+                    }
+                    if let Err(_) = tgt_tx.send(buf[0..n].to_vec()).await {
+                        return;
+                    }
+                    readpos += n as u64;
+                }
+                wr = wrt_rx.recv() => {
+                    println!("WRITE\n");
+                    match wr {
+                        Some((pos, buf)) => {
+                            // TODO: handle errors
+                            if let Err(e) = target.seek(SeekFrom::Start(pos)).await {
+                                println!("Seek error: {}\n", e);
+                            }
+                            seek_back = true;
+                            if let Err(e) = target.write(&buf).await {
+                                println!("Write error: {}\n", e);
+                            }
+                        },
+                        None => {
+                            // Shouldn't happen normally
+                            println!("Write sender dropped, exiting.\n");
+                            return;
+                        }
+                    }
+                }
             }
         }
     });
 
     let mut total = 0;
     let mut diff = 0;
+    let mut pos = 0;
 
     while let (Some(src), Some(tgt)) = join!(src_rx.recv(), tgt_rx.recv()) {
         let src_l = src.len();
@@ -150,10 +190,15 @@ async fn main() {
         bar.inc(n as u64);
 
         if src != tgt {
-            // Write
+            println!("Difference at position {}\n", pos);
+            if let Err(_) = wrt_tx.send((pos as u64, src.to_vec())).await {
+                println!("Target write receiver dropped, exiting");
+                break;
+            }
             diff += 1;
         }
         total += 1;
+        pos += n;
     }
 
     bar.finish_at_current_pos();
