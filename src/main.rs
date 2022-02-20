@@ -17,10 +17,15 @@ use {
         },
     },
     tokio::{
-        fs::File,
-        io::AsyncReadExt,
-        io::AsyncWriteExt,
-        io::AsyncSeekExt,
+        fs::{
+            File,
+            OpenOptions,
+        },
+        io::{
+            AsyncReadExt,
+            AsyncWriteExt,
+            AsyncSeekExt,
+        },
         join,
         select,
         sync::mpsc,
@@ -80,14 +85,15 @@ async fn main() {
     let target_name = matches.value_of("target").ok_or("Target name is mandatory").unwrap();
 
     // Read both file sizes
-    let mut source = File::open(source_name).await.unwrap();
-    let mut target = File::open(target_name).await.unwrap();
+    let mut source_r = File::open(source_name).await.unwrap();
+    let mut target_r = File::open(target_name).await.unwrap();
+    let mut target_w = OpenOptions::new().write(true).open(target_name).await.unwrap();
 
     //let source_meta = source.metadata().await.unwrap();
     //let target_meta = target.metadata().await.unwrap();
 
-    let source_size = get_size(&source).await;
-    let target_size = get_size(&target).await;
+    let source_size = get_size(&source_r).await;
+    let target_size = get_size(&target_r).await;
 
     println!("{} -> {}", source_size, target_size);
 
@@ -99,75 +105,45 @@ async fn main() {
         .template("{wide_bar} [{percent:>3}% {bytes_per_sec} ETA: {eta_precise}]")
         .progress_chars("##-"));
 
-    let block_size = 1;//4096 * 4;
+    let block_size = 4096 * 4;
 
     let (src_tx, mut src_rx) = mpsc::channel(10);
     let (tgt_tx, mut tgt_rx) = mpsc::channel(10);
-    let (wrt_tx, mut wrt_rx) = mpsc::channel::<(u64, Vec<u8>)>(10);
 
     // Reads source
     tokio::spawn( async move {
         let mut buf = vec![0_u8; block_size];
         loop {
-            let n = match source.read(&mut buf).await {
+            let n = match source_r.read(&mut buf).await {
                 Err(e) => panic!("{}", e),
                 Ok(n) => n
             };
             if n == 0 {
+                // No more to read
                 return;
             }
             if let Err(_) = src_tx.send(buf[0..n].to_vec()).await {
+                // No one to receive
                 return;
             }
         }
     });
 
-    // Reads/writes target
+    // Reads target
     tokio::spawn( async move {
         let mut buf = vec![0_u8; block_size];
-        let mut readpos = 0;
-        let mut seek_back = false;
         loop {
-            select! {
-                n_ = target.read(&mut buf) => {
-                    let n = match n_ {
-                        Err(e) => panic!("{}", e),
-                        Ok(n) => n
-                    };
-                    if n == 0 {
-                        return;
-                    }
-                    if seek_back {
-                        if let Err(e) = target.seek(SeekFrom::Start(readpos)).await {
-                            println!("Seek error: {}", e);
-                        }
-                        seek_back = false;
-                    }
-                    if let Err(_) = tgt_tx.send(buf[0..n].to_vec()).await {
-                        return;
-                    }
-                    readpos += n as u64;
-                }
-                wr = wrt_rx.recv() => {
-                    match wr {
-                        Some((pos, buf)) => {
-                            println!("WRITE\n");
-                            // TODO: handle errors
-                            if let Err(e) = target.seek(SeekFrom::Start(pos)).await {
-                                println!("Seek error: {}\n", e);
-                            }
-                            seek_back = true;
-                            if let Err(e) = target.write(&buf).await {
-                                println!("Write error: {}\n", e);
-                            }
-                        },
-                        None => {
-                            // Shouldn't happen normally
-                            println!("Write sender dropped, exiting.\n");
-                            return;
-                        }
-                    }
-                }
+            let n = match target_r.read(&mut buf).await {
+                Err(e) => panic!("{}", e),
+                Ok(n) => n
+            };
+            if n == 0 {
+                // No more to read
+                return;
+            }
+            if let Err(_) = tgt_tx.send(buf[0..n].to_vec()).await {
+                // No one to receive
+                return;
             }
         }
     });
@@ -176,6 +152,7 @@ async fn main() {
     let mut diff = 0;
     let mut pos = 0;
 
+    // Compares buffers and writes target
     while let (Some(src), Some(tgt)) = join!(src_rx.recv(), tgt_rx.recv()) {
         let src_l = src.len();
         let tgt_l = tgt.len();
@@ -190,15 +167,19 @@ async fn main() {
         bar.inc(n as u64);
 
         if src != tgt {
-            println!("Difference at position {}\n", pos);
-            if let Err(_) = wrt_tx.send((pos as u64, src)).await {
-                println!("Target write receiver dropped, exiting");
+            //println!("Difference at position {}", pos);
+            if let Err(e) = target_w.seek(SeekFrom::Start(pos)).await {
+                println!("Failed to seek, exiting: {}", e);
+                break;
+            }
+            if let Err(e) = target_w.write(&src).await {
+                println!("Failed to write, exiting: {}", e);
                 break;
             }
             diff += 1;
         }
         total += 1;
-        pos += n;
+        pos += n as u64;
     }
 
     bar.finish_at_current_pos();
