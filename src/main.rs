@@ -99,7 +99,7 @@ async fn main() {
         .template("{wide_bar} [{percent:>3}% {bytes_per_sec} ETA: {eta_precise}]")
         .progress_chars("##-"));
 
-    let block_size = 4096 * 4;
+    let block_size = 1;//4096 * 4;
 
     let (src_tx, mut src_rx) = mpsc::channel(10);
     let (tgt_tx, mut tgt_rx) = mpsc::channel(10);
@@ -149,9 +149,9 @@ async fn main() {
                     readpos += n as u64;
                 }
                 wr = wrt_rx.recv() => {
-                    println!("WRITE\n");
                     match wr {
                         Some((pos, buf)) => {
+                            println!("WRITE\n");
                             // TODO: handle errors
                             if let Err(e) = target.seek(SeekFrom::Start(pos)).await {
                                 println!("Seek error: {}\n", e);
@@ -191,7 +191,7 @@ async fn main() {
 
         if src != tgt {
             println!("Difference at position {}\n", pos);
-            if let Err(_) = wrt_tx.send((pos as u64, src.to_vec())).await {
+            if let Err(_) = wrt_tx.send((pos as u64, src)).await {
                 println!("Target write receiver dropped, exiting");
                 break;
             }
