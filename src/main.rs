@@ -1,9 +1,6 @@
 use {
     //boolinator::Boolinator,
-    clap::{
-        Arg,
-        App
-    },
+    clap::Parser,
     indicatif::{
         ProgressBar,
         ProgressStyle,
@@ -27,10 +24,23 @@ use {
             AsyncSeekExt,
         },
         join,
-        select,
         sync::mpsc,
     },
 };
+
+#[derive(Parser, Debug)]
+#[clap(author, version, about, long_about = None)]
+struct Args {
+    /// Source file or device
+    source: String,
+
+    /// Target file or device
+    target: String,
+
+    /// Size of blocks in bytes to read/write at once
+    #[clap(short, long, default_value_t = 4096 * 8)]
+    block_size: usize,
+}
 
 // See linux/fs.h
 const BLKGETSIZE64_CODE: u8 = 0x12;
@@ -59,30 +69,10 @@ async fn get_size(f: &File) -> u64 {
 
 #[tokio::main]
 async fn main() {
-    let matches = App::new("SSD Sync")
-        .version("1.0")
-        .author("Tamas Fabian <giganetom@gmail.com>")
-        .about("Copy data between SSDs keeping doing as few writes as possible.")
-        .arg(Arg::with_name("source")
-            .short("s")
-            .long("source")
-            .value_name("SOURCE")
-            .help("copy data from here")
-            .takes_value(true)
-            .required(true)
-            .index(1))
-        .arg(Arg::with_name("target")
-            .short("t")
-            .long("target")
-            .value_name("TARGET")
-            .help("write here")
-            .takes_value(true)
-            .required(true)
-            .index(2))
-        .get_matches();
+    let args = Args::parse();
 
-    let source_name = matches.value_of("source").ok_or("Source name is mandatory").unwrap();
-    let target_name = matches.value_of("target").ok_or("Target name is mandatory").unwrap();
+    let source_name = &args.source;
+    let target_name = &args.target;
 
     // Read both file sizes
     let mut source_r = File::open(source_name).await.unwrap();
@@ -105,7 +95,7 @@ async fn main() {
         .template("{wide_bar} [{percent:>3}% {bytes_per_sec} ETA: {eta_precise}]")
         .progress_chars("##-"));
 
-    let block_size = 4096 * 4;
+    let block_size = 4096 * 8;
 
     let (src_tx, mut src_rx) = mpsc::channel(10);
     let (tgt_tx, mut tgt_rx) = mpsc::channel(10);
