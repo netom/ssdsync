@@ -42,6 +42,19 @@ struct Args {
     block_size: usize,
 }
 
+#[derive(PartialEq, Eq, Clone)]
+struct Buf {
+    length: usize,
+    data: Vec<u8>
+}
+
+impl Buf {
+    fn as_slice(&self) -> &[u8] {
+        let (ret, _) = self.data.as_slice().split_at(self.length);
+        ret
+    }
+}
+
 // See linux/fs.h
 const BLKGETSIZE64_CODE: u8 = 0x12;
 const BLKGETSIZE64_SEQ: u8 = 114;
@@ -67,6 +80,33 @@ async fn get_size(f: &File) -> u64 {
     }
 }
 
+async fn read_blocks(
+    block_size: usize,
+    mut file: File,
+    buf_fw_tx: tokio::sync::mpsc::Sender<Buf>,
+    buf_bk_rx: tokio::sync::mpsc::Receiver<Buf>,
+) {
+    let mut buf = Buf {
+        length: 0,
+        data: vec![0_u8; block_size]
+    };
+
+    loop {
+        buf.length = match file.read(&mut buf.data).await {
+            Err(e) => panic!("{}", e),
+            Ok(n) => n
+        };
+        if buf.length == 0 {
+            // No more to read
+            return;
+        }
+        if let Err(_) = buf_fw_tx.send(buf.clone()).await {
+            // No one to receive
+            return;
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
@@ -75,7 +115,7 @@ async fn main() {
     let target_name = &args.target;
 
     // Read both file sizes
-    let mut source_r = File::open(source_name).await.unwrap();
+    let source_r = File::open(source_name).await.unwrap();
     let mut target_r = File::open(target_name).await.unwrap();
     let mut target_w = OpenOptions::new().write(true).open(target_name).await.unwrap();
 
@@ -96,56 +136,27 @@ async fn main() {
         .progress_chars("##-"));
 
     let block_size = 4096 * 8;
+    let num_bufs = 16;
 
-    let (src_tx, mut src_rx) = mpsc::channel(10);
-    let (tgt_tx, mut tgt_rx) = mpsc::channel(10);
+    let (src_fw_tx, mut src_fw_rx) = mpsc::channel(num_bufs);
+    let (src_bk_tx, mut src_bk_rx) = mpsc::channel(num_bufs);
+    let (tgt_fw_tx, mut tgt_fw_rx) = mpsc::channel(num_bufs);
+    let (tgt_bk_tx, mut tgt_bk_rx) = mpsc::channel(num_bufs);
 
     // Reads source
-    tokio::spawn( async move {
-        let mut buf = vec![0_u8; block_size];
-        loop {
-            let n = match source_r.read(&mut buf).await {
-                Err(e) => panic!("{}", e),
-                Ok(n) => n
-            };
-            if n == 0 {
-                // No more to read
-                return;
-            }
-            if let Err(_) = src_tx.send(buf[0..n].to_vec()).await {
-                // No one to receive
-                return;
-            }
-        }
-    });
+    tokio::spawn(read_blocks(block_size, source_r, src_fw_tx, src_bk_rx));
 
     // Reads target
-    tokio::spawn( async move {
-        let mut buf = vec![0_u8; block_size];
-        loop {
-            let n = match target_r.read(&mut buf).await {
-                Err(e) => panic!("{}", e),
-                Ok(n) => n
-            };
-            if n == 0 {
-                // No more to read
-                return;
-            }
-            if let Err(_) = tgt_tx.send(buf[0..n].to_vec()).await {
-                // No one to receive
-                return;
-            }
-        }
-    });
+    tokio::spawn(read_blocks(block_size, target_r, tgt_fw_tx, tgt_bk_rx));
 
     let mut total = 0;
     let mut diff = 0;
     let mut pos = 0;
 
     // Compares buffers and writes target
-    while let (Some(src), Some(tgt)) = join!(src_rx.recv(), tgt_rx.recv()) {
-        let src_l = src.len();
-        let tgt_l = tgt.len();
+    while let (Some(src), Some(tgt)) = join!(src_fw_rx.recv(), tgt_fw_rx.recv()) {
+        let src_l = src.length;
+        let tgt_l = tgt.length;
 
         if src_l == 0 || tgt_l == 0 || src_l != tgt_l {
             println!("Done.");
@@ -162,7 +173,7 @@ async fn main() {
                 println!("Failed to seek, exiting: {}", e);
                 break;
             }
-            if let Err(e) = target_w.write(&src).await {
+            if let Err(e) = target_w.write(&src.as_slice()).await {
                 println!("Failed to write, exiting: {}", e);
                 break;
             }
