@@ -1,5 +1,4 @@
 use {
-    //boolinator::Boolinator,
     clap::Parser,
     indicatif::{
         ProgressBar,
