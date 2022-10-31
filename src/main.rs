@@ -145,6 +145,7 @@ async fn main() {
 
     bar.set_style(ProgressStyle::default_bar()
         .template("{wide_bar} [{percent:>3}% {bytes_per_sec} ETA: {eta_precise}]")
+        .expect("Template error")
         .progress_chars("##-"));
 
     let block_size = 4096 * 8;
@@ -200,7 +201,7 @@ async fn main() {
         pos += n as u64;
     }
 
-    bar.finish_at_current_pos();
+    bar.finish();
 
     println!("\nTotal: {}, different: {}", total, diff);
 }
