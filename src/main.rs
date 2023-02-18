@@ -1,5 +1,3 @@
-use std::collections::VecDeque;
-
 use {
     clap::Parser,
     indicatif::{ProgressBar, ProgressStyle},
@@ -26,17 +24,24 @@ struct Args {
     target: String,
 
     /// Size of blocks in bytes to read/write at once
-    #[clap(short, long, default_value_t = 4096 * 8)]
+    #[clap(short, long, default_value_t = 16 * 1024)]
     block_size: usize,
 }
 
-#[derive(PartialEq, Eq, Clone)]
+#[derive(PartialEq, Eq, Clone, Debug)]
 struct Buf {
     length: usize,
     data: Vec<u8>,
 }
 
 impl Buf {
+    fn new(size: usize) -> Self {
+        Buf {
+            length: 0,
+            data: vec![0; size],
+        }
+    }
+
     fn as_slice(&self) -> &[u8] {
         let (ret, _) = self.data.as_slice().split_at(self.length);
         ret
@@ -112,10 +117,9 @@ async fn write_blocks(
             }
         }
 
-        if let Err(_) = buf_tx.send(buf).await {
-            // Nobody's listening
-            return;
-        }
+        // If no one needs the buffer, that's fine. We still might
+        // have buffers to be written.
+        let _ = buf_tx.send(buf).await;
     }
 }
 
@@ -151,62 +155,51 @@ async fn main() {
             .progress_chars("##-"),
     );
 
-    let block_size = 16 * 1024;
-    let num_bufs = 16;
+    let channel_size = 8;
 
     // Channels for talking with the source file reader task
-    let (src_fw_tx, src_fw_rx) = mpsc::channel(num_bufs);
-    let (src_bk_tx, mut src_bk_rx) = mpsc::channel(num_bufs);
+    let (src_fw_tx, src_fw_rx) = mpsc::channel(channel_size);
+    let (src_bk_tx, mut src_bk_rx) = mpsc::channel(channel_size);
 
     // Channels for talking with the target file reader task
-    let (tgt_r_fw_tx, tgt_r_fw_rx) = mpsc::channel(num_bufs);
-    let (tgt_r_bk_tx, mut tgt_r_bk_rx) = mpsc::channel(num_bufs);
+    let (tgt_r_fw_tx, tgt_r_fw_rx) = mpsc::channel(channel_size);
+    let (tgt_r_bk_tx, mut tgt_r_bk_rx) = mpsc::channel(channel_size);
 
     // Channels for talking with the target file writer task
-    let (tgt_w_fw_tx, tgt_w_fw_rx) = mpsc::channel(num_bufs);
-    let (tgt_w_bk_tx, mut tgt_w_bk_rx) = mpsc::channel(num_bufs);
+    let (tgt_w_fw_tx, tgt_w_fw_rx) = mpsc::channel(channel_size);
 
-    // Reads source
-    tokio::spawn(read_blocks(source_r, src_fw_rx, src_bk_tx));
+    // Source reader
+    let src_r = tokio::spawn(read_blocks(source_r, src_fw_rx, src_bk_tx));
 
-    // Reads target
-    tokio::spawn(read_blocks(target_r, tgt_r_fw_rx, tgt_r_bk_tx));
+    // Target reader
+    let tgt_r = tokio::spawn(read_blocks(target_r, tgt_r_fw_rx, tgt_r_bk_tx));
 
-    // Writes target
-    tokio::spawn(write_blocks(target_w, tgt_w_fw_rx, tgt_w_bk_tx));
+    // Target writer
+    //
+    // Connect the sorce file reader's forward channel's transmitter
+    // so the written blocks immediately returned to the reader
+    let tgt_w = tokio::spawn(write_blocks(target_w, tgt_w_fw_rx, src_fw_tx.clone()));
 
     let mut total = 0;
     let mut diff = 0;
     let mut pos = 0;
 
-    // Allocate a pool of buffers, l=4
-    let mut buffers: VecDeque<Buf> = VecDeque::with_capacity(4);
-    for _ in 0..4 {
-        buffers.push_back(Buf {
-            data: vec![0; block_size],
-            length: 0,
-        });
+    // Send the first few buffers to the readers
+    // Wait for them to be sent back
+    let n_buffers = channel_size / 2;
+    for _ in 0..n_buffers {
+        src_fw_tx.send(Buf::new(args.block_size)).await.unwrap();
+        tgt_r_fw_tx.send(Buf::new(args.block_size)).await.unwrap();
     }
 
-    // Send the first pair of buffers to the readers
-    // Wait for them to be sent back
-    let mut bsrc: Buf;
-    let mut btgt: Buf;
-    let (_, _, bsrc_, btgt_) = join!(
-        src_fw_tx.send(buffers.pop_front().unwrap()),
-        tgt_r_fw_tx.send(buffers.pop_front().unwrap()),
-        src_bk_rx.recv(),
-        tgt_r_bk_rx.recv()
-    );
-    bsrc = bsrc_.unwrap(); // TODO: handle dropped tx?
-    btgt = btgt_.unwrap(); // TODO: handle dropped tx?
-
     loop {
-        // We have a pair of buffers from the readers
+        // Get a pair of buffers from the readers
+        let (bsrc, btgt) = join!(src_bk_rx.recv(), tgt_r_bk_rx.recv());
+        let bsrc = bsrc.unwrap(); // TODO: handle dropped tx?
+        let btgt = btgt.unwrap(); // TODO: handle dropped tx?
 
         // Check wether we're done
         if bsrc.length == 0 || btgt.length == 0 || bsrc.length != btgt.length {
-            println!("Done.");
             break;
         }
 
@@ -214,50 +207,37 @@ async fn main() {
 
         bar.inc(n as u64);
 
-        // Send a couple of new buffers back from the pool
-        let (_, _) = join!(
-            src_fw_tx.send(buffers.pop_front().unwrap()),
-            tgt_r_fw_tx.send(buffers.pop_front().unwrap())
-        ); // TODO: handle unsuccessful send?
-
         // Compare the arrived buffers
         // If they match:
-        //   Return the buffers to the pool
+        //   Return the buffers to the channel
         //   Wait for buffers from the readers
         //   Start from the beginning
         if bsrc == btgt {
-            buffers.push_back(bsrc);
-            buffers.push_back(btgt);
-            let (bsrc_, btgt_) = join!(src_bk_rx.recv(), tgt_r_bk_rx.recv());
-            bsrc = bsrc_.unwrap(); // TODO: handle dropped tx?
-            btgt = btgt_.unwrap(); // TODO: handle dropped tx?
+            let _ = join!(src_fw_tx.send(bsrc), tgt_r_fw_tx.send(btgt));
             continue;
         }
         // They're different.
 
-        // Return the one from the target reader to the pool
-        buffers.push_back(btgt);
-
         // Send the one arrived from the source reader to the writer
-        // Wait for buffers from the writer and the readers
-        let (_, bw, bsrc_, btgt_) = join!(
-            tgt_w_fw_tx.send((pos, bsrc)),
-            tgt_w_bk_rx.recv(),
-            src_bk_rx.recv(),
-            tgt_r_bk_rx.recv()
-        );
-        bsrc = bsrc_.unwrap(); // TODO: handle dropped tx?
-        btgt = btgt_.unwrap(); // TODO: handle dropped tx?
-
-        // Return the writer's buffer to the pool
-        buffers.push_back(bw.unwrap()); // TODO: handle dropped tx?
+        // Send the one arrived from the target reader back to it
+        let _ = join!(tgt_w_fw_tx.send((pos, bsrc)), tgt_r_fw_tx.send(btgt));
 
         diff += 1;
         total += 1;
         pos += n as u64;
     }
 
+    // Drop channels, so tasks can terminate
+    drop(tgt_w_fw_tx);
+    drop(src_fw_tx);
+    drop(src_bk_rx);
+    drop(tgt_r_fw_tx);
+    drop(tgt_r_bk_rx);
+
+    // Wait for the tasks to finish
+    let _ = join!(tgt_w, src_r, tgt_r);
+
     bar.finish();
 
-    println!("\nTotal: {}, different: {}", total, diff);
+    println!("\nFinished. Total: {}, different: {}", total, diff);
 }
