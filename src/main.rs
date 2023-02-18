@@ -1,27 +1,16 @@
+use std::collections::VecDeque;
+
 use {
     clap::Parser,
-    indicatif::{
-        ProgressBar,
-        ProgressStyle,
-    },
+    indicatif::{ProgressBar, ProgressStyle},
     nix::ioctl_read,
     std::{
         io::SeekFrom,
-        os::unix::{
-            fs::FileTypeExt,
-            io::AsRawFd,
-        },
+        os::unix::{fs::FileTypeExt, io::AsRawFd},
     },
     tokio::{
-        fs::{
-            File,
-            OpenOptions,
-        },
-        io::{
-            AsyncReadExt,
-            AsyncWriteExt,
-            AsyncSeekExt,
-        },
+        fs::{File, OpenOptions},
+        io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
         join,
         sync::mpsc,
     },
@@ -44,7 +33,7 @@ struct Args {
 #[derive(PartialEq, Eq, Clone)]
 struct Buf {
     length: usize,
-    data: Vec<u8>
+    data: Vec<u8>,
 }
 
 impl Buf {
@@ -79,46 +68,54 @@ async fn get_size(f: &File) -> u64 {
     }
 }
 
-async fn read_block(
-    mut buf: Buf,
-    file: &mut File,
-    buf_fw_tx: &tokio::sync::mpsc::Sender<Buf>,
-) -> bool {
-    buf.length = match file.read(&mut buf.data).await {
-        Err(e) => panic!("{}", e),
-        Ok(n) => n
-    };
-    if buf.length == 0 {
-        // No more to read
-        return false;
+async fn read_blocks(
+    mut file: File,
+    mut buf_rx: tokio::sync::mpsc::Receiver<Buf>,
+    buf_tx: tokio::sync::mpsc::Sender<Buf>,
+) {
+    while let Some(mut buf) = buf_rx.recv().await {
+        buf.length = match file.read(&mut buf.data).await {
+            Err(e) => panic!("{}", e),
+            Ok(n) => n,
+        };
+        if let Err(_) = buf_tx.send(buf).await {
+            // Nobody's listening
+            return;
+        }
     }
-    if let Err(_) = buf_fw_tx.send(buf).await {
-        // No one to receive
-        return false;
-    }
-    return true;
 }
 
-async fn read_blocks(
-    block_size: usize,
-    num_bufs: usize,
-    mut file: File,
-    buf_fw_tx: tokio::sync::mpsc::Sender<Buf>,
-    mut buf_bk_rx: tokio::sync::mpsc::Receiver<Buf>,
+async fn write_blocks(
+    mut f: File,
+    mut buf_rx: tokio::sync::mpsc::Receiver<(u64, Buf)>,
+    buf_tx: tokio::sync::mpsc::Sender<Buf>,
 ) {
-    for _ in 0..num_bufs {
-        let buf = Buf {
-            length: 0,
-            data: vec![0_u8; block_size]
-        };
-        if !read_block(buf, &mut file, &buf_fw_tx).await {
+    while let Some((pos, buf)) = buf_rx.recv().await {
+        // TODO: be smart about seek. Call only when needed.
+        if let Err(e) = f.seek(SeekFrom::Start(pos)).await {
+            println!("Failed to seek, exiting: {}", e);
             return;
-        };
-    }
-    while let Some(buf) = buf_bk_rx.recv().await {
-        if !read_block(buf, &mut file, &buf_fw_tx).await {
+        }
+        match f.write(&buf.as_slice()).await {
+            Ok(written) => {
+                if written != buf.length {
+                    println!(
+                        "Could not write {} bytes, only {}, exiting.",
+                        buf.length, written
+                    );
+                    return;
+                }
+            }
+            Err(e) => {
+                println!("Failed to write, exiting: {}", e);
+                return;
+            }
+        }
+
+        if let Err(_) = buf_tx.send(buf).await {
+            // Nobody's listening
             return;
-        };
+        }
     }
 }
 
@@ -132,7 +129,11 @@ async fn main() {
     // Read both file sizes
     let source_r = File::open(source_name).await.unwrap();
     let target_r = File::open(target_name).await.unwrap();
-    let mut target_w = OpenOptions::new().write(true).open(target_name).await.unwrap();
+    let target_w = OpenOptions::new()
+        .write(true)
+        .open(target_name)
+        .await
+        .unwrap();
 
     let source_size = get_size(&source_r).await;
     let target_size = get_size(&target_r).await;
@@ -143,60 +144,115 @@ async fn main() {
 
     let bar = ProgressBar::new(source_size);
 
-    bar.set_style(ProgressStyle::default_bar()
-        .template("{wide_bar} [{percent:>3}% {bytes_per_sec} ETA: {eta_precise}]")
-        .expect("Template error")
-        .progress_chars("##-"));
+    bar.set_style(
+        ProgressStyle::default_bar()
+            .template("{wide_bar} [{percent:>3}% {bytes_per_sec} ETA: {eta_precise}]")
+            .expect("Template error")
+            .progress_chars("##-"),
+    );
 
-    let block_size = 4096 * 8;
+    let block_size = 16 * 1024;
     let num_bufs = 16;
 
-    let (src_fw_tx, mut src_fw_rx) = mpsc::channel(num_bufs);
-    let (src_bk_tx, src_bk_rx) = mpsc::channel(num_bufs);
-    let (tgt_fw_tx, mut tgt_fw_rx) = mpsc::channel(num_bufs);
-    let (tgt_bk_tx, tgt_bk_rx) = mpsc::channel(num_bufs);
+    // Channels for talking with the source file reader task
+    let (src_fw_tx, src_fw_rx) = mpsc::channel(num_bufs);
+    let (src_bk_tx, mut src_bk_rx) = mpsc::channel(num_bufs);
+
+    // Channels for talking with the target file reader task
+    let (tgt_r_fw_tx, tgt_r_fw_rx) = mpsc::channel(num_bufs);
+    let (tgt_r_bk_tx, mut tgt_r_bk_rx) = mpsc::channel(num_bufs);
+
+    // Channels for talking with the target file writer task
+    let (tgt_w_fw_tx, tgt_w_fw_rx) = mpsc::channel(num_bufs);
+    let (tgt_w_bk_tx, mut tgt_w_bk_rx) = mpsc::channel(num_bufs);
 
     // Reads source
-    tokio::spawn(read_blocks(
-        block_size, num_bufs, source_r,
-        src_fw_tx, src_bk_rx
-    ));
+    tokio::spawn(read_blocks(source_r, src_fw_rx, src_bk_tx));
 
     // Reads target
-    tokio::spawn(read_blocks(
-        block_size, num_bufs, target_r,
-        tgt_fw_tx, tgt_bk_rx
-    ));
+    tokio::spawn(read_blocks(target_r, tgt_r_fw_rx, tgt_r_bk_tx));
+
+    // Writes target
+    tokio::spawn(write_blocks(target_w, tgt_w_fw_rx, tgt_w_bk_tx));
 
     let mut total = 0;
     let mut diff = 0;
     let mut pos = 0;
 
-    // Compares buffers and writes target
-    while let (Some(src), Some(tgt)) = join!(src_fw_rx.recv(), tgt_fw_rx.recv()) {
-        if src.length == 0 || tgt.length == 0 || src.length != tgt.length {
+    // Allocate a pool of buffers, l=4
+    let mut buffers: VecDeque<Buf> = VecDeque::with_capacity(4);
+    for _ in 0..4 {
+        buffers.push_back(Buf {
+            data: vec![0; block_size],
+            length: 0,
+        });
+    }
+
+    // Send the first pair of buffers to the readers
+    // Wait for them to be sent back
+    let mut bsrc: Buf;
+    let mut btgt: Buf;
+    let (_, _, bsrc_, btgt_) = join!(
+        src_fw_tx.send(buffers.pop_front().unwrap()),
+        tgt_r_fw_tx.send(buffers.pop_front().unwrap()),
+        src_bk_rx.recv(),
+        tgt_r_bk_rx.recv()
+    );
+    bsrc = bsrc_.unwrap(); // TODO: handle dropped tx?
+    btgt = btgt_.unwrap(); // TODO: handle dropped tx?
+
+    loop {
+        // We have a pair of buffers from the readers
+
+        // Check wether we're done
+        if bsrc.length == 0 || btgt.length == 0 || bsrc.length != btgt.length {
             println!("Done.");
             break;
         }
 
-        let n = src.length;
+        let n = bsrc.length;
 
         bar.inc(n as u64);
 
-        if src != tgt {
-            if let Err(e) = target_w.seek(SeekFrom::Start(pos)).await {
-                println!("Failed to seek, exiting: {}", e);
-                break;
-            }
-            if let Err(e) = target_w.write(&src.as_slice()).await {
-                println!("Failed to write, exiting: {}", e);
-                break;
-            }
-            diff += 1;
+        // Send a couple of new buffers back from the pool
+        let (_, _) = join!(
+            src_fw_tx.send(buffers.pop_front().unwrap()),
+            tgt_r_fw_tx.send(buffers.pop_front().unwrap())
+        ); // TODO: handle unsuccessful send?
+
+        // Compare the arrived buffers
+        // If they match:
+        //   Return the buffers to the pool
+        //   Wait for buffers from the readers
+        //   Start from the beginning
+        if bsrc == btgt {
+            buffers.push_back(bsrc);
+            buffers.push_back(btgt);
+            let (bsrc_, btgt_) = join!(src_bk_rx.recv(), tgt_r_bk_rx.recv());
+            bsrc = bsrc_.unwrap(); // TODO: handle dropped tx?
+            btgt = btgt_.unwrap(); // TODO: handle dropped tx?
+            continue;
         }
+        // They're different.
 
-        let _ = join!(src_bk_tx.send(src), tgt_bk_tx.send(tgt));
+        // Return the one from the target reader to the pool
+        buffers.push_back(btgt);
 
+        // Send the one arrived from the source reader to the writer
+        // Wait for buffers from the writer and the readers
+        let (_, bw, bsrc_, btgt_) = join!(
+            tgt_w_fw_tx.send((pos, bsrc)),
+            tgt_w_bk_rx.recv(),
+            src_bk_rx.recv(),
+            tgt_r_bk_rx.recv()
+        );
+        bsrc = bsrc_.unwrap(); // TODO: handle dropped tx?
+        btgt = btgt_.unwrap(); // TODO: handle dropped tx?
+
+        // Return the writer's buffer to the pool
+        buffers.push_back(bw.unwrap()); // TODO: handle dropped tx?
+
+        diff += 1;
         total += 1;
         pos += n as u64;
     }
